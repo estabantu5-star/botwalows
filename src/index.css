@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --color-wa-bg-main: #0c141a;
+  --color-wa-bg-dark: #111b21;
+  --color-wa-bg-panel: #202c33;
+  --color-wa-green: #00a884;
+  --color-wa-text-light: #e9edef;
+}
+
+.glass {
+  background: rgba(32, 44, 51, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.linking-code-char {
+  background: #2a3942;
+  border: 1px solid #3b4a54;
+  border-radius: 8px;
+  width: 44px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  font-weight: 700;
+  color: #00a884;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+}

@@ -1,0 +1,6 @@
+{
+  "name": "WhatsApp RVO Bot",
+  "description": "WhatsApp Bot with Pairing Code Login and Retrieve View Once (RVO) feature.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
