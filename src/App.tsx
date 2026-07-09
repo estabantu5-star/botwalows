@@ -62,7 +62,7 @@ interface Feature {
 }
 
 // Gunakan local fetch wrapper agar tidak memodifikasi window.fetch secara global (yang dilarang/diblokir di beberapa browser/iframe)
-const fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+const apiFetch = (input: RequestInfo | URL, init?: RequestInit) => {
   const password = localStorage.getItem("admin_password") || "";
   const headers = new Headers(init?.headers);
   if (password) {
@@ -112,6 +112,23 @@ export default function App() {
   const [vpnUploadStatus, setVpnUploadStatus] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    try {
+      const res = await apiFetch(input, init);
+      if (res.status === 401) {
+        const urlStr = typeof input === "string" ? input : "";
+        if (!urlStr.includes("/api/auth/status") && !urlStr.includes("/api/auth/login")) {
+          localStorage.removeItem("admin_password");
+          setIsAuthenticated(false);
+        }
+      }
+      return res;
+    } catch (err) {
+      console.warn(`Network request failed for ${input}:`, err);
+      throw err;
+    }
+  };
+
   const checkAuthStatus = async () => {
     try {
       const res = await fetch("/api/auth/status");
@@ -134,7 +151,7 @@ export default function App() {
         }
       }
     } catch (e) {
-      console.error("Gagal memeriksa status otentikasi:", e);
+      console.warn("Gagal memeriksa status otentikasi:", e);
     } finally {
       setCheckingAuth(false);
     }
@@ -189,7 +206,7 @@ export default function App() {
         }
       }
     } catch (e) {
-      console.error("Gagal mengambil konfigurasi SSH", e);
+      console.warn("Gagal mengambil konfigurasi SSH", e);
     }
   };
 
@@ -275,7 +292,7 @@ export default function App() {
         setFeatures(data.features || []);
       }
     } catch (e) {
-      console.error("Gagal mengambil daftar fitur", e);
+      console.warn("Gagal mengambil daftar fitur", e);
     }
   };
 
@@ -294,7 +311,7 @@ export default function App() {
         alert(errData.error || "Gagal mengubah status fitur.");
       }
     } catch (e) {
-      console.error("Gagal mengubah status fitur", e);
+      console.warn("Gagal mengubah status fitur", e);
     } finally {
       setTogglingId(null);
     }
@@ -327,7 +344,7 @@ export default function App() {
         }
       }
     } catch (e) {
-      console.error("Gagal mengambil status bot", e);
+      console.warn("Gagal mengambil status bot", e);
     }
   };
 
@@ -340,7 +357,7 @@ export default function App() {
         setLogs(data.logs || []);
       }
     } catch (e) {
-      console.error("Gagal mengambil logs", e);
+      console.warn("Gagal mengambil logs", e);
     }
   };
 
