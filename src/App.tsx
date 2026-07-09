@@ -96,6 +96,8 @@ export default function App() {
   const [features, setFeatures] = useState<Feature[]>([]);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [featureStats, setFeatureStats] = useState<Record<string, number>>({});
+  const [aiConfig, setAiConfig] = useState<{ allowedChats: { jid: string; autoReply: boolean; welcomeSent?: boolean }[] }>({ allowedChats: [] });
+  const [aiConfigSaving, setAiConfigSaving] = useState(false);
 
   // Active navigation tab
   const [activeTab, setActiveTab] = useState<"whatsapp" | "ssh">("whatsapp");
@@ -279,6 +281,8 @@ export default function App() {
         return <Smile className="w-4 h-4 text-purple-400" />;
       case "phot":
         return <Image className="w-4 h-4 text-yellow-400" />;
+      case "ai":
+        return <MessageSquare className="w-4 h-4 text-indigo-400" />;
       default:
         return <Info className="w-4 h-4 text-gray-400" />;
     }
@@ -294,6 +298,66 @@ export default function App() {
     } catch (e) {
       console.warn("Gagal mengambil daftar fitur", e);
     }
+  };
+
+  const fetchAiConfig = async () => {
+    try {
+      const res = await fetch("/api/ai/config");
+      if (res.ok) {
+        const data = await res.json();
+        setAiConfig(data || { allowedChats: [] });
+      }
+    } catch (e) {
+      console.warn("Gagal mengambil konfigurasi AI", e);
+    }
+  };
+
+  const handleUpdateAiConfig = async (allowedChats: { jid: string; autoReply: boolean; welcomeSent?: boolean }[]) => {
+    setAiConfigSaving(true);
+    try {
+      const res = await fetch("/api/ai/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allowedChats })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAiConfig(data.config || { allowedChats });
+      } else {
+        const errData = await res.json();
+        alert(errData.error || "Gagal menyimpan konfigurasi AI.");
+      }
+    } catch (e) {
+      console.warn("Gagal menyimpan konfigurasi AI", e);
+    } finally {
+      setAiConfigSaving(false);
+    }
+  };
+
+  const [newAiChat, setNewAiChat] = useState("");
+
+  const handleAddAiChat = () => {
+    const val = newAiChat.trim();
+    if (!val) return;
+    if (aiConfig.allowedChats.some(c => c.jid.toLowerCase() === val.toLowerCase())) {
+      setNewAiChat("");
+      return;
+    }
+    const updated = [...aiConfig.allowedChats, { jid: val, autoReply: false }];
+    handleUpdateAiConfig(updated);
+    setNewAiChat("");
+  };
+
+  const handleRemoveAiChat = (chatToRemove: string) => {
+    const updated = aiConfig.allowedChats.filter(c => c.jid !== chatToRemove);
+    handleUpdateAiConfig(updated);
+  };
+
+  const handleToggleAutoReply = (jid: string, currentAutoReply: boolean) => {
+    const updated = aiConfig.allowedChats.map(c => 
+      c.jid === jid ? { ...c, autoReply: !currentAutoReply } : c
+    );
+    handleUpdateAiConfig(updated);
   };
 
   const handleToggleFeature = async (id: string, currentStatus: boolean) => {
@@ -379,6 +443,7 @@ export default function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
     fetchFeatures();
+    fetchAiConfig();
     fetchSshConfig();
   }, [isAuthenticated]);
 
@@ -1045,6 +1110,88 @@ export default function App() {
                       <span className="text-emerald-400 font-bold shrink-0">Cara:</span>
                       <span className="leading-relaxed">{feat.usage}</span>
                     </div>
+
+                    {feat.id === "ai" && (
+                      <div className="mt-3 border-t border-white/5 pt-3 space-y-2.5">
+                        <label className="text-[10px] font-bold text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
+                          <LockOpen className="w-3.5 h-3.5 text-indigo-400" />
+                          Daftar Izin Chat (Nomor / Grup)
+                        </label>
+                        <p className="text-[9px] text-gray-500 leading-normal">
+                          Kosongkan agar fitur AI bisa dipakai siapa saja. Isi untuk membatasi akses (misal masukkan nomor HP <code className="bg-white/5 px-1 py-0.5 rounded text-indigo-400">628xxx</code> atau ID grup <code className="bg-white/5 px-1 py-0.5 rounded text-indigo-400">xxxx@g.us</code>).
+                        </p>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            placeholder="Contoh: 628123456789 atau 120363@g.us"
+                            className="bg-black/40 border border-white/10 rounded-xl px-3 py-1.5 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 flex-1"
+                            value={newAiChat}
+                            onChange={(e) => setNewAiChat(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                handleAddAiChat();
+                              }
+                            }}
+                          />
+                          <button
+                            onClick={handleAddAiChat}
+                            disabled={aiConfigSaving}
+                            className="bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-bold text-[10px] px-3.5 py-1.5 rounded-xl transition-all uppercase tracking-wider shrink-0 disabled:opacity-50"
+                          >
+                            {aiConfigSaving ? "Simpan..." : "Tambah"}
+                          </button>
+                        </div>
+
+                        {aiConfig.allowedChats && aiConfig.allowedChats.length > 0 ? (
+                          <div className="space-y-1.5 pt-1 max-h-48 overflow-y-auto pr-1">
+                            {aiConfig.allowedChats.map((chat) => (
+                              <div
+                                key={chat.jid}
+                                className="bg-black/35 border border-white/5 hover:border-white/10 rounded-xl px-3 py-2 flex items-center justify-between gap-3 transition-all"
+                              >
+                                <div className="flex flex-col gap-0.5 min-w-0">
+                                  <span className="text-[10px] font-mono text-indigo-300 font-medium truncate" title={chat.jid}>{chat.jid}</span>
+                                  <span className="text-[9px] text-gray-400">
+                                    {chat.autoReply ? "✨ Auto-Reply Tanpa Trigger" : "🤖 Butuh Trigger (.ai)"}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2.5 shrink-0">
+                                  {/* Auto Reply Toggle */}
+                                  <button
+                                    onClick={() => handleToggleAutoReply(chat.jid, chat.autoReply)}
+                                    disabled={aiConfigSaving}
+                                    className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                      chat.autoReply ? "bg-emerald-500" : "bg-zinc-700"
+                                    } ${aiConfigSaving ? "opacity-50 cursor-not-allowed" : ""}`}
+                                    title={chat.autoReply ? "Matikan Auto-Reply (kembali butuh .ai)" : "Aktifkan Auto-Reply (tanpa trigger)"}
+                                  >
+                                    <span
+                                      className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-lg transition duration-200 ease-in-out ${
+                                        chat.autoReply ? "translate-x-3" : "translate-x-0"
+                                      }`}
+                                    />
+                                  </button>
+                                  
+                                  <button
+                                    onClick={() => handleRemoveAiChat(chat.jid)}
+                                    disabled={aiConfigSaving}
+                                    className="text-gray-500 hover:text-rose-400 transition-colors disabled:opacity-50 text-[10px] px-1.5 py-0.5 hover:bg-white/5 rounded"
+                                    title="Hapus"
+                                  >
+                                    Hapus
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-[9px] text-amber-500/85 italic bg-amber-500/5 border border-amber-500/10 rounded-xl p-2.5 leading-normal">
+                            ⚠️ Fitur AI hanya aktif untuk JID/nomor yang didaftarkan di atas. Jika kosong, AI tidak akan merespon siapapun demi keamanan!
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}

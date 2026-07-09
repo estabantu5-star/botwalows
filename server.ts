@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import makeWASocket, {
     useMultiFileAuthState,
@@ -716,6 +717,22 @@ const defaultFeatures = [
         enabled: true
     },
     {
+        id: "ai",
+        name: "GPT-4o Chat AI",
+        trigger: ".ai, !ai",
+        description: "Bertanya atau ngobrol apa saja dengan model AI pintar GPT-4o.",
+        usage: "Ketik '.ai <pertanyaan_mu>' atau '!ai <pertanyaan_mu>'.",
+        enabled: true
+    },
+    {
+        id: "jid",
+        name: "WhatsApp JID Checker",
+        trigger: ".jid, !jid",
+        description: "Mengecek ID unik (JID) percakapan aktif atau grup saat ini.",
+        usage: "Ketik '.jid' atau '!jid' di grup atau obrolan pribadi.",
+        enabled: true
+    },
+    {
         id: "menuas",
         name: "Menu & Usage Guide",
         trigger: ".menuas, !menuas",
@@ -726,6 +743,110 @@ const defaultFeatures = [
 ];
 
 let features = [...defaultFeatures];
+
+interface ChatMemory {
+    role: "user" | "assistant";
+    content: string;
+}
+
+const aiMemoryStore = new Map<string, ChatMemory[]>();
+const MAX_MEMORY_LENGTH = 16; // Simpan 16 pesan terakhir biar ingatan lumayan panjang tapi efisien
+
+interface AllowedChat {
+    jid: string;
+    autoReply: boolean;
+    welcomeSent?: boolean;
+}
+
+let aiConfig = {
+    allowedChats: [] as AllowedChat[]
+};
+
+function loadAiConfig() {
+    try {
+        if (fs.existsSync("ai_config.json")) {
+            const saved = JSON.parse(fs.readFileSync("ai_config.json", "utf-8"));
+            if (saved && Array.isArray(saved.allowedChats)) {
+                aiConfig.allowedChats = saved.allowedChats.map((item: any) => {
+                    if (typeof item === "string") {
+                        return { jid: item, autoReply: false, welcomeSent: false };
+                    }
+                    return {
+                        jid: String(item.jid || "").trim(),
+                        autoReply: !!item.autoReply,
+                        welcomeSent: !!item.welcomeSent
+                    };
+                }).filter((item: any) => item.jid);
+            }
+        }
+    } catch (e) {
+        console.error("Gagal membaca ai_config.json", e);
+    }
+}
+
+function saveAiConfig() {
+    try {
+        fs.writeFileSync("ai_config.json", JSON.stringify(aiConfig, null, 2), "utf-8");
+    } catch (e) {
+        console.error("Gagal menyimpan ai_config.json", e);
+    }
+}
+
+function isChatAllowedForAi(jid: string): { allowed: boolean; autoReply: boolean; welcomeSent: boolean } {
+    if (!aiConfig.allowedChats || aiConfig.allowedChats.length === 0) {
+        return { allowed: false, autoReply: false, welcomeSent: false }; // Jika kosong, tidak diizinkan untuk siapapun demi keamanan
+    }
+    const cleanJid = jid.toLowerCase().trim();
+    for (const item of aiConfig.allowedChats) {
+        const targetJid = item.jid.toLowerCase().trim();
+        if (!targetJid) continue;
+        
+        let matched = false;
+        // Match exact
+        if (cleanJid === targetJid) matched = true;
+        // Match substring
+        else if (cleanJid.includes(targetJid) || targetJid.includes(cleanJid)) matched = true;
+        else {
+            // Normalize 08xxx to 628xxx for Indonesian phone numbers
+            let normalizedAllowed = targetJid;
+            if (normalizedAllowed.startsWith("0")) {
+                normalizedAllowed = "62" + normalizedAllowed.slice(1);
+            }
+            if (cleanJid.includes(normalizedAllowed)) matched = true;
+        }
+
+        if (matched) {
+            return {
+                allowed: true,
+                autoReply: !!item.autoReply,
+                welcomeSent: !!item.welcomeSent
+            };
+        }
+    }
+    return { allowed: false, autoReply: false, welcomeSent: false };
+}
+
+function markWelcomeSent(jid: string) {
+    const cleanJid = jid.toLowerCase().trim();
+    for (const item of aiConfig.allowedChats) {
+        const targetJid = item.jid.toLowerCase().trim();
+        let matched = false;
+        if (cleanJid === targetJid) matched = true;
+        else if (cleanJid.includes(targetJid) || targetJid.includes(cleanJid)) matched = true;
+        else {
+            let normalizedAllowed = targetJid;
+            if (normalizedAllowed.startsWith("0")) {
+                normalizedAllowed = "62" + normalizedAllowed.slice(1);
+            }
+            if (cleanJid.includes(normalizedAllowed)) matched = true;
+        }
+
+        if (matched) {
+            item.welcomeSent = true;
+        }
+    }
+    saveAiConfig();
+}
 
 function loadFeatures() {
     try {
@@ -987,6 +1108,8 @@ async function connectToWhatsApp(phone: string) {
                 const isUpwinkCommand = /^[.!]upwink\b/i.test(trimBody);
                 const isTxtimgCommand = /^[.!]txtimg\b/i.test(trimBody);
                 const isMenuasCommand = /^[.!]menuas\b/i.test(trimBody);
+                const isAiCommand = /^[.!]ai\b/i.test(trimBody);
+                const isJidCommand = /^[.!]jid\b/i.test(trimBody);
 
                 if (body) {
                     const fromMeStr = msg.key.fromMe ? " (dari HP Sendiri)" : "";
@@ -995,6 +1118,15 @@ async function connectToWhatsApp(phone: string) {
                 }
 
                 const senderJid = msg.key.remoteJid;
+
+                const isAnyCommand = isRvoCommand || isBratVidCommand || isBratCommand || isDownloadCommand || 
+                                     isSpotifyCommand || isCurlCommand || isStikCommand || isPhotCommand || 
+                                     isLoggerCommand || isUpwinkCommand || isTxtimgCommand || isMenuasCommand || 
+                                     isAiCommand || isJidCommand;
+
+                const allowedResult = isChatAllowedForAi(senderJid);
+                const isAiAutoReply = allowedResult.allowed && allowedResult.autoReply && !isAnyCommand && !msg.key.fromMe && body.trim() !== "";
+                const shouldTriggerAi = isAiCommand || isAiAutoReply;
 
                 // Check if waiting for password for this sender
                 const activeLogSession = loggerSessions.get(senderJid);
@@ -2802,6 +2934,239 @@ async function connectToWhatsApp(phone: string) {
                     }
                     continue;
                 }
+
+                if (shouldTriggerAi) {
+                    const remoteJid = msg.key.remoteJid;
+                    if (!isFeatureEnabled("ai")) {
+                        if (isAiCommand) {
+                            await sock.sendMessage(remoteJid, {
+                                text: "⚠️ *Fitur Dinonaktifkan*\n\nMaaf, fitur *GPT-4o Chat AI* saat ini sedang dinonaktifkan oleh Admin melalui Dashboard."
+                            }, { quoted: msg });
+                        }
+                        continue;
+                    }
+
+                    // Check restriction
+                    const checkResult = isChatAllowedForAi(remoteJid);
+                    if (!checkResult.allowed) {
+                        if (isAiCommand) {
+                            await sock.sendMessage(remoteJid, {
+                                text: "🔒 *Akses Terbatas*\n\nMaaf bos, percakapan ini tidak diizinkan untuk menggunakan fitur AI (.ai). Hubungi Admin untuk mendaftarkan nomor/grup ini."
+                            }, { quoted: msg });
+                        }
+                        continue;
+                    }
+
+                    // For AI Auto-Reply, check if we need to send the greeting message first
+                    if (isAiAutoReply && !checkResult.welcomeSent) {
+                        const cleanPhone = senderJid.split("@")[0];
+                        const displayName = msg.pushName || "Alya";
+                        const greeting = `Hai ${displayName} (${cleanPhone}), yahh Ken nya lagi kerja nih, sementara aku dikirim buat nemenin kamu biar nggak bete, nanti aku kasih tahu kalo Ken udah bisa megang hp.`;
+                        
+                        await sock.sendMessage(remoteJid, { text: greeting }, { quoted: msg });
+                        markWelcomeSent(senderJid);
+                    }
+
+                    // Extract query from prompt
+                    const prompt = isAiCommand 
+                        ? body.substring(body.toLowerCase().indexOf("ai") + 2).trim() 
+                        : body.trim();
+
+                    if (!prompt) {
+                        if (isAiCommand) {
+                            await sock.sendMessage(remoteJid, {
+                                text: "🤖 *GPT-4o Chat AI* 🤖\n\nTanya apa saja ke AI! Caranya:\n\n`.ai <pertanyaanmu>`\n\nContoh:\n`.ai jelaskan apa itu black hole`\n\n💡 _Ketik `.ai reset` untuk menghapus riwayat ingatan chat._"
+                            }, { quoted: msg });
+                        }
+                        continue;
+                    }
+
+                    if (isAiCommand) {
+                        const lowPrompt = prompt.toLowerCase().trim();
+                        if (lowPrompt === "reset" || lowPrompt === "clear") {
+                            aiMemoryStore.delete(remoteJid);
+                            await sock.sendMessage(remoteJid, {
+                                text: "🧹 *Memory AI Berhasil Direset!*\n\nIngatan Astro Bot untuk obrolan ini sudah bersih kembali bos!"
+                            }, { quoted: msg });
+                            continue;
+                        }
+                    }
+
+                    incrementFeatureUsage("ai");
+                    addLog(`${isAiAutoReply ? "Auto-Reply AI" : "Perintah AI"} dideteksi dari ${remoteJid}: "${prompt.substring(0, 30)}..."`);
+
+                    // Send reaction indicator
+                    try {
+                        await sock.sendMessage(remoteJid, {
+                            react: {
+                                text: "⚡",
+                                key: msg.key
+                            }
+                        });
+                    } catch (reactErr) {}
+
+                    // Get memory for this chat
+                    let chatHistory = aiMemoryStore.get(remoteJid) || [];
+
+                    // Construct system instructions and memory context
+                    const systemPrompt = `Kamu adalah Astro Bot, sebuah bot asisten WhatsApp yang pintar, ramah, dan asyik. Pemilik kamu adalah astrolynx (Ken). Jawab percakapan dengan bahasa Indonesia yang santai, seru, dan penuh kepribadian. Selalu ingat identitas ini dalam setiap jawabanmu!`;
+
+                    let contextPrompt = `${systemPrompt}\n\n`;
+                    if (chatHistory.length > 0) {
+                        contextPrompt += `Riwayat obrolan kita sebelumnya:\n`;
+                        for (const h of chatHistory) {
+                            const actor = h.role === "user" ? "User" : "Astro Bot";
+                            contextPrompt += `[${actor}]: ${h.content}\n`;
+                        }
+                        contextPrompt += `\n`;
+                    }
+                    contextPrompt += `[User]: ${prompt}\n[Astro Bot]:`;
+
+                    try {
+                        let aiResponse = "";
+                        let isGeminiUsed = false;
+
+                        try {
+                        // Call Azbry GPT-4o API
+                        const apiUrL = `https://api.azbry.com/api/ai/gpt4o?q=${encodeURIComponent(contextPrompt)}`;
+                        addLog(`Memanggil GPT-4o API dengan context memory: ${apiUrL}`);
+
+                        const response = await fetch(apiUrL, {
+                            headers: {
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                            }
+                        });
+
+                        if (!response.ok) {
+                            throw new Error(`Server returned status code ${response.status}`);
+                        }
+
+                        const textResult = await response.text();
+                        
+                        // Let's check if it returned error/502
+                        if (textResult.includes("error code: 502") || textResult.includes("Bad Gateway") || !textResult.trim()) {
+                            throw new Error("API Azbry GPT-4o saat ini sedang 502 Bad Gateway / offline.");
+                        }
+
+                        // Try parsing if it's JSON with result, otherwise use plain text
+                        aiResponse = textResult;
+                        try {
+                            const parsed = JSON.parse(textResult);
+                            if (parsed && typeof parsed === "object") {
+                                if (parsed.result && typeof parsed.result === "object" && parsed.result.answer) {
+                                    aiResponse = parsed.result.answer;
+                                } else {
+                                    aiResponse = parsed.result || parsed.response || parsed.text || parsed.data || JSON.stringify(parsed);
+                                }
+                            }
+                        } catch (jsonErr) {
+                            // Keep as plain text
+                        }
+                    } catch (err: any) {
+                        console.warn("Azbry API Gagal, mencoba fallback ke Gemini API:", err);
+                        addLog("Azbry API Gagal, mencoba fallback ke Gemini API: " + (err.message || err));
+                        
+                        try {
+                            // Initialize GoogleGenAI with Gemini API key
+                            const geminiKey = process.env.GEMINI_API_KEY;
+                            const ai = new GoogleGenAI({
+                                apiKey: geminiKey,
+                                httpOptions: {
+                                    headers: {
+                                        "User-Agent": "aistudio-build"
+                                    }
+                                }
+                            });
+
+                            // Reconstruct contents format for Gemini
+                            const contents: any[] = [];
+                            for (const h of chatHistory) {
+                                contents.push({
+                                    role: h.role === "user" ? "user" : "model",
+                                    parts: [{ text: h.content }]
+                                });
+                            }
+                            contents.push({
+                                role: "user",
+                                parts: [{ text: prompt }]
+                            });
+
+                            const geminiResponse = await ai.models.generateContent({
+                                model: "gemini-3.5-flash",
+                                contents: contents,
+                                config: {
+                                    systemInstruction: systemPrompt,
+                                    temperature: 0.7
+                                }
+                            });
+
+                            if (geminiResponse && geminiResponse.text) {
+                                aiResponse = geminiResponse.text;
+                                isGeminiUsed = true;
+                                addLog("Berhasil mendapatkan respon dari Gemini API (Fallback)");
+                            } else {
+                                throw new Error("Gemini API tidak mengembalikan teks.");
+                            }
+                        } catch (geminiErr: any) {
+                            console.error("Gemini Fallback Error:", geminiErr);
+                            addLog("Gemini Fallback Error: " + (geminiErr.message || geminiErr));
+                            throw new Error(`API Utama (GPT-4o) dan API Cadangan (Gemini) keduanya gagal.\n\n• GPT-4o: ${err.message || err}\n• Gemini: ${geminiErr.message || geminiErr}`);
+                        }
+                    }
+
+                    const badge = isGeminiUsed ? "🤖 *Astro Bot* 🤖" : "🤖 *GPT-4o AI ANSWER* 🤖";
+                    await sock.sendMessage(remoteJid, {
+                        text: `${badge}\n\n${aiResponse.trim()}`
+                    }, { quoted: msg });
+
+                    // Save to history on successful response
+                    chatHistory.push({ role: "user", content: prompt });
+                    chatHistory.push({ role: "assistant", content: aiResponse });
+                    if (chatHistory.length > MAX_MEMORY_LENGTH) {
+                        chatHistory = chatHistory.slice(-MAX_MEMORY_LENGTH);
+                    }
+                    aiMemoryStore.set(remoteJid, chatHistory);
+
+                    } catch (err: any) {
+                        console.error("AI Command Error:", err);
+                        addLog("AI Command Error: " + (err.message || err));
+                        await sock.sendMessage(remoteJid, {
+                            text: `❌ *Gagal Mendapatkan Jawaban AI*\n\nMaaf bos, terjadi kesalahan atau API sedang down.\n\n*Error:* ${err.message || err}`
+                        }, { quoted: msg });
+                    }
+                    continue;
+                }
+
+                if (isJidCommand) {
+                    const remoteJid = msg.key.remoteJid;
+                    if (!isFeatureEnabled("jid")) {
+                        await sock.sendMessage(remoteJid, {
+                            text: "⚠️ *Fitur Dinonaktifkan*\n\nMaaf, fitur *WhatsApp JID Checker* saat ini sedang dinonaktifkan oleh Admin melalui Dashboard."
+                        }, { quoted: msg });
+                        continue;
+                    }
+                    incrementFeatureUsage("jid");
+                    addLog(`Perintah JID dideteksi dari ${remoteJid}`);
+
+                    // Send reaction indicator
+                    try {
+                        await sock.sendMessage(remoteJid, {
+                            react: {
+                                text: "📋",
+                                key: msg.key
+                            }
+                        });
+                    } catch (reactErr) {}
+
+                    const senderJid = msg.key.participant || msg.key.remoteJid;
+                    const message = `📋 *WhatsApp JID Info* 📋\n\n` +
+                                    `*• Chat / Group JID:* \`${remoteJid}\`\n` +
+                                    `*• Sender JID:* \`${senderJid}\`\n\n` +
+                                    `💡 _JID ini bisa Anda gunakan untuk membatasi fitur AI di Dashboard!_`;
+
+                    await sock.sendMessage(remoteJid, { text: message }, { quoted: msg });
+                    continue;
+                }
             }
         });
     } catch (e: any) {
@@ -2874,6 +3239,46 @@ app.post("/api/auth/login", (req, res) => {
         return res.json({ success: true });
     }
     return res.status(401).json({ error: "Password salah!" });
+});
+
+app.get("/api/ai/config", (req, res) => {
+    return res.json(aiConfig);
+});
+
+app.post("/api/ai/config", (req, res) => {
+    const { allowedChats } = req.body;
+    if (!Array.isArray(allowedChats)) {
+        return res.status(400).json({ error: "Format daftar nomor/grup tidak valid! Harus berupa array." });
+    }
+    
+    aiConfig.allowedChats = allowedChats.map((item: any) => {
+        if (typeof item === "string") {
+            return { jid: item.trim(), autoReply: false, welcomeSent: false };
+        }
+        
+        const cleanJid = String(item.jid || "").trim();
+        const newAutoReply = !!item.autoReply;
+        
+        // Cari apakah sebelumnya sudah ada di config untuk mempertahankan status welcomeSent
+        const existing = aiConfig.allowedChats.find(c => c.jid.toLowerCase().trim() === cleanJid.toLowerCase().trim());
+        let welcomeSent = existing ? !!existing.welcomeSent : false;
+        
+        // Jika autoReply diaktifkan (dari mati ke menyala), reset status welcomeSent agar kirim salam pembuka lagi
+        if (newAutoReply && (!existing || !existing.autoReply)) {
+            welcomeSent = false;
+        }
+        
+        return {
+            jid: cleanJid,
+            autoReply: newAutoReply,
+            welcomeSent
+        };
+    }).filter(item => item.jid);
+    
+    saveAiConfig();
+    const listJids = aiConfig.allowedChats.map(item => `${item.jid} (AutoReply: ${item.autoReply})`).join(", ");
+    addGlobalLog(`Daftar izin fitur AI diperbarui: [${listJids}]`);
+    return res.json({ success: true, config: aiConfig });
 });
 
 app.get("/api/features", (req, res) => {
@@ -3050,6 +3455,7 @@ app.post("/api/bot/disconnect", async (req, res) => {
 
 async function main() {
     loadFeatures();
+    loadAiConfig();
     loadSSHConfig();
     loadSSHActivityLogs();
     autoConnect();
