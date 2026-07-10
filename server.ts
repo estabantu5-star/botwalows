@@ -1,6 +1,8 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import makeWASocket, {
@@ -733,6 +735,14 @@ const defaultFeatures = [
         enabled: true
     },
     {
+        id: "noteas",
+        name: "Noteas Status AI",
+        trigger: ".noteas, !noteas",
+        description: "Mengatur catatan status atau kondisi Ken saat ini agar Astro Bot tahu apa yang sedang dilakukan Ken dan menggunakannya saat menjawab chat otomatis.",
+        usage: "Ketik '.noteas <catatan status>' untuk menyimpan, '.noteas clear' untuk menghapus status.",
+        enabled: true
+    },
+    {
         id: "menuas",
         name: "Menu & Usage Guide",
         trigger: ".menuas, !menuas",
@@ -759,24 +769,216 @@ interface AllowedChat {
 }
 
 let aiConfig = {
-    allowedChats: [] as AllowedChat[]
+    allowedChats: [] as AllowedChat[],
+    engine: "gemini" as "gemini" | "gpt4o" | "restapi"
 };
+
+const lidToJidMap = new Map<string, string>();
+const jidToLidMap = new Map<string, string>();
+
+function loadLidMap() {
+    try {
+        if (fs.existsSync("lid_map.json")) {
+            const saved = JSON.parse(fs.readFileSync("lid_map.json", "utf-8"));
+            if (saved && typeof saved === "object") {
+                for (const [lid, jid] of Object.entries(saved)) {
+                    if (typeof lid === "string" && typeof jid === "string") {
+                        lidToJidMap.set(lid.toLowerCase().trim(), jid.toLowerCase().trim());
+                        jidToLidMap.set(jid.toLowerCase().trim(), lid.toLowerCase().trim());
+                    }
+                }
+            }
+        }
+        // Pre-seed Alya's LID mapping to make it work instantly
+        lidToJidMap.set("87742474121438@lid", "6289502093559@s.whatsapp.net");
+        jidToLidMap.set("6289502093559@s.whatsapp.net", "87742474121438@lid");
+    } catch (e) {
+        console.error("Gagal membaca lid_map.json", e);
+    }
+}
+
+function saveLidMap() {
+    try {
+        const obj: Record<string, string> = {};
+        for (const [lid, jid] of lidToJidMap.entries()) {
+            obj[lid] = jid;
+        }
+        fs.writeFileSync("lid_map.json", JSON.stringify(obj, null, 2), "utf-8");
+    } catch (e) {
+        console.error("Gagal menyimpan lid_map.json", e);
+    }
+}
+
+let noteasText = "";
+
+function loadNoteas() {
+    try {
+        if (fs.existsSync("noteas.json")) {
+            const saved = JSON.parse(fs.readFileSync("noteas.json", "utf-8"));
+            if (saved && typeof saved.text === "string") {
+                noteasText = saved.text;
+            }
+        }
+    } catch (e) {
+        console.error("Gagal membaca noteas.json", e);
+    }
+}
+
+function saveNoteas() {
+    try {
+        fs.writeFileSync("noteas.json", JSON.stringify({ text: noteasText }, null, 2), "utf-8");
+    } catch (e) {
+        console.error("Gagal menyimpan noteas.json", e);
+    }
+}
+
+interface NoteasAllowedChat {
+    jid: string;
+}
+
+let noteasConfig = {
+    allowedChats: [] as NoteasAllowedChat[]
+};
+
+function loadNoteasConfig() {
+    try {
+        if (fs.existsSync("noteas_config.json")) {
+            const data = fs.readFileSync("noteas_config.json", "utf-8");
+            const saved = JSON.parse(data);
+            if (saved && Array.isArray(saved.allowedChats)) {
+                noteasConfig.allowedChats = saved.allowedChats.map((item: any) => {
+                    const cleanJid = String(typeof item === "string" ? item : (item.jid || "")).trim();
+                    return { jid: cleanJid };
+                }).filter(item => item.jid);
+            }
+        }
+    } catch (e) {
+        addGlobalLog("Gagal memuat noteas_config.json, menggunakan default.");
+    }
+}
+
+function saveNoteasConfig() {
+    try {
+        fs.writeFileSync("noteas_config.json", JSON.stringify(noteasConfig, null, 2), "utf-8");
+    } catch (e) {
+        addGlobalLog("Gagal menyimpan noteas_config.json");
+    }
+}
+
+function isChatAllowedForNoteas(jid: string): boolean {
+    if (!isFeatureEnabled("noteas")) {
+        return false;
+    }
+    if (!noteasConfig.allowedChats || noteasConfig.allowedChats.length === 0) {
+        return false;
+    }
+    const cleanJid = jid.toLowerCase().trim();
+    const mappedJid = cleanJid.endsWith("@lid") ? lidToJidMap.get(cleanJid) : null;
+
+    for (const item of noteasConfig.allowedChats) {
+        const targetJid = item.jid.toLowerCase().trim();
+        if (!targetJid) continue;
+        
+        let matched = false;
+        
+        const checkMatch = (jidToCheck: string) => {
+            if (jidToCheck === targetJid) return true;
+            if (jidToCheck.includes(targetJid) || targetJid.includes(jidToCheck)) return true;
+            
+            let normalizedAllowed = targetJid;
+            if (normalizedAllowed.startsWith("0")) {
+                normalizedAllowed = "62" + normalizedAllowed.slice(1);
+            }
+            if (jidToCheck.includes(normalizedAllowed)) return true;
+            return false;
+        };
+
+        if (checkMatch(cleanJid)) matched = true;
+        else if (mappedJid && checkMatch(mappedJid)) matched = true;
+
+        if (matched) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function detectMediaType(buffer: Buffer): "image" | "video" | "audio" | "unknown" {
+    if (!buffer || buffer.length < 12) return "unknown";
+
+    // Image magic numbers
+    // JPEG: FF D8
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
+        return "image";
+    }
+    // PNG: 89 50 4E 47
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+        return "image";
+    }
+    // WEBP: RIFF .... WEBP
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46) {
+        const fourCC = buffer.toString("ascii", 8, 12);
+        if (fourCC === "WEBP") {
+            return "image";
+        }
+    }
+    // GIF: GIF8
+    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) {
+        return "image";
+    }
+
+    // Video magic numbers
+    // MP4: contains 'ftyp' at offset 4
+    const isMp4 = buffer[4] === 0x66 && buffer[5] === 0x74 && buffer[6] === 0x79 && buffer[7] === 0x70;
+    if (isMp4) {
+        return "video";
+    }
+    // MKV/WebM: 1A 45 DF A3
+    if (buffer[0] === 0x1A && buffer[1] === 0x45 && buffer[2] === 0xDF && buffer[3] === 0xA3) {
+        return "video";
+    }
+
+    // Audio magic numbers
+    // ID3/MP3: ID3 or FF FB
+    if (buffer[0] === 0x49 && buffer[1] === 0x44 && buffer[2] === 0x33) {
+        return "audio";
+    }
+    if (buffer[0] === 0xFF && (buffer[1] === 0xFB || buffer[1] === 0xF3 || buffer[1] === 0xF2)) {
+        return "audio";
+    }
+    // OGG: OggS
+    if (buffer[0] === 0x4F && buffer[1] === 0x67 && buffer[2] === 0x67 && buffer[3] === 0x53) {
+        return "audio";
+    }
+
+    return "unknown";
+}
 
 function loadAiConfig() {
     try {
+        loadLidMap();
+        loadNoteas();
+        loadNoteasConfig();
         if (fs.existsSync("ai_config.json")) {
             const saved = JSON.parse(fs.readFileSync("ai_config.json", "utf-8"));
-            if (saved && Array.isArray(saved.allowedChats)) {
-                aiConfig.allowedChats = saved.allowedChats.map((item: any) => {
-                    if (typeof item === "string") {
-                        return { jid: item, autoReply: false, welcomeSent: false };
-                    }
-                    return {
-                        jid: String(item.jid || "").trim(),
-                        autoReply: !!item.autoReply,
-                        welcomeSent: !!item.welcomeSent
-                    };
-                }).filter((item: any) => item.jid);
+            if (saved) {
+                if (Array.isArray(saved.allowedChats)) {
+                    aiConfig.allowedChats = saved.allowedChats.map((item: any) => {
+                        if (typeof item === "string") {
+                            return { jid: item, autoReply: false, welcomeSent: false };
+                        }
+                        return {
+                            jid: String(item.jid || "").trim(),
+                            autoReply: !!item.autoReply,
+                            welcomeSent: !!item.welcomeSent
+                        };
+                    }).filter((item: any) => item.jid);
+                }
+                if (saved.engine === "gemini" || saved.engine === "gpt4o" || saved.engine === "restapi") {
+                    aiConfig.engine = saved.engine;
+                } else {
+                    aiConfig.engine = "gemini";
+                }
             }
         }
     } catch (e) {
@@ -797,23 +999,28 @@ function isChatAllowedForAi(jid: string): { allowed: boolean; autoReply: boolean
         return { allowed: false, autoReply: false, welcomeSent: false }; // Jika kosong, tidak diizinkan untuk siapapun demi keamanan
     }
     const cleanJid = jid.toLowerCase().trim();
+    const mappedJid = cleanJid.endsWith("@lid") ? lidToJidMap.get(cleanJid) : null;
+
     for (const item of aiConfig.allowedChats) {
         const targetJid = item.jid.toLowerCase().trim();
         if (!targetJid) continue;
         
         let matched = false;
-        // Match exact
-        if (cleanJid === targetJid) matched = true;
-        // Match substring
-        else if (cleanJid.includes(targetJid) || targetJid.includes(cleanJid)) matched = true;
-        else {
-            // Normalize 08xxx to 628xxx for Indonesian phone numbers
+        
+        const checkMatch = (jidToCheck: string) => {
+            if (jidToCheck === targetJid) return true;
+            if (jidToCheck.includes(targetJid) || targetJid.includes(jidToCheck)) return true;
+            
             let normalizedAllowed = targetJid;
             if (normalizedAllowed.startsWith("0")) {
                 normalizedAllowed = "62" + normalizedAllowed.slice(1);
             }
-            if (cleanJid.includes(normalizedAllowed)) matched = true;
-        }
+            if (jidToCheck.includes(normalizedAllowed)) return true;
+            return false;
+        };
+
+        if (checkMatch(cleanJid)) matched = true;
+        else if (mappedJid && checkMatch(mappedJid)) matched = true;
 
         if (matched) {
             return {
@@ -828,21 +1035,30 @@ function isChatAllowedForAi(jid: string): { allowed: boolean; autoReply: boolean
 
 function markWelcomeSent(jid: string) {
     const cleanJid = jid.toLowerCase().trim();
+    const mappedJid = cleanJid.endsWith("@lid") ? lidToJidMap.get(cleanJid) : null;
+
     for (const item of aiConfig.allowedChats) {
         const targetJid = item.jid.toLowerCase().trim();
         let matched = false;
-        if (cleanJid === targetJid) matched = true;
-        else if (cleanJid.includes(targetJid) || targetJid.includes(cleanJid)) matched = true;
-        else {
+        
+        const checkMatch = (jidToCheck: string) => {
+            if (jidToCheck === targetJid) return true;
+            if (jidToCheck.includes(targetJid) || targetJid.includes(jidToCheck)) return true;
+            
             let normalizedAllowed = targetJid;
             if (normalizedAllowed.startsWith("0")) {
                 normalizedAllowed = "62" + normalizedAllowed.slice(1);
             }
-            if (cleanJid.includes(normalizedAllowed)) matched = true;
-        }
+            if (jidToCheck.includes(normalizedAllowed)) return true;
+            return false;
+        };
+
+        if (checkMatch(cleanJid)) matched = true;
+        else if (mappedJid && checkMatch(mappedJid)) matched = true;
 
         if (matched) {
             item.welcomeSent = true;
+            break;
         }
     }
     saveAiConfig();
@@ -1024,8 +1240,17 @@ async function connectToWhatsApp(phone: string) {
             
             if (connection === "close") {
                 const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                addLog(`Koneksi terputus. Alasan: ${statusCode || "unknown"}. Reconnecting: ${shouldReconnect}`);
+                
+                // 440 adalah DisconnectReason.connectionReplaced (koneksi bentrok)
+                const isReplaced = statusCode === 440 || statusCode === DisconnectReason.connectionReplaced;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut && !isReplaced;
+                
+                if (isReplaced) {
+                    addLog(`Koneksi terputus karena BENTROK (Replaced/440). Ada bot lain/sesi lain yang aktif menggunakan nomor ${phone}.`);
+                    addLog(`Koneksi otomatis DIHENTIKAN untuk mencegah loop putus-nyambung. Pastikan tidak ada tab/server lain (seperti App Preview vs App Shared) yang berjalan bersamaan.`);
+                } else {
+                    addLog(`Koneksi terputus. Alasan: ${statusCode || "unknown"}. Reconnecting: ${shouldReconnect}`);
+                }
                 
                 session.pairingCode = "";
                 if (shouldReconnect) {
@@ -1034,10 +1259,13 @@ async function connectToWhatsApp(phone: string) {
                 } else {
                     session.status = "DISCONNECTED";
                     session.sock = null;
-                    if (fs.existsSync(authFolder)) {
-                        fs.rmSync(authFolder, { recursive: true, force: true });
+                    // Hanya hapus kredensial jika benar-benar logout (401)
+                    if (statusCode === DisconnectReason.loggedOut) {
+                        if (fs.existsSync(authFolder)) {
+                            fs.rmSync(authFolder, { recursive: true, force: true });
+                        }
+                        sessions.delete(phone);
                     }
-                    sessions.delete(phone);
                 }
             }
         });
@@ -1054,6 +1282,44 @@ async function connectToWhatsApp(phone: string) {
                 addLog(`Gagal meminta kode tautan: ${err.message || err}`);
             }
         }
+
+        sock.ev.on("contacts.upsert", (contacts: any) => {
+            let updated = false;
+            for (const contact of contacts) {
+                if (contact.id && contact.lid) {
+                    const cleanId = contact.id.toLowerCase().trim();
+                    const cleanLid = contact.lid.toLowerCase().trim();
+                    if (lidToJidMap.get(cleanLid) !== cleanId) {
+                        lidToJidMap.set(cleanLid, cleanId);
+                        jidToLidMap.set(cleanId, cleanLid);
+                        updated = true;
+                        addLog(`[LID Map] Menautkan LID ${cleanLid} ke JID ${cleanId} (contacts.upsert)`);
+                    }
+                }
+            }
+            if (updated) {
+                saveLidMap();
+            }
+        });
+
+        sock.ev.on("contacts.update", (updates: any) => {
+            let updated = false;
+            for (const update of updates) {
+                if (update.id && update.lid) {
+                    const cleanId = update.id.toLowerCase().trim();
+                    const cleanLid = update.lid.toLowerCase().trim();
+                    if (lidToJidMap.get(cleanLid) !== cleanId) {
+                        lidToJidMap.set(cleanLid, cleanId);
+                        jidToLidMap.set(cleanId, cleanLid);
+                        updated = true;
+                        addLog(`[LID Map] Menautkan LID ${cleanLid} ke JID ${cleanId} (contacts.update)`);
+                    }
+                }
+            }
+            if (updated) {
+                saveLidMap();
+            }
+        });
 
         sock.ev.on("messages.upsert", async (m: any) => {
             if (m.type !== "notify" && m.type !== "append") return;
@@ -1110,6 +1376,7 @@ async function connectToWhatsApp(phone: string) {
                 const isMenuasCommand = /^[.!]menuas\b/i.test(trimBody);
                 const isAiCommand = /^[.!]ai\b/i.test(trimBody);
                 const isJidCommand = /^[.!]jid\b/i.test(trimBody);
+                const isNoteasCommand = /^[.!]noteas\b/i.test(trimBody);
 
                 if (body) {
                     const fromMeStr = msg.key.fromMe ? " (dari HP Sendiri)" : "";
@@ -1122,7 +1389,7 @@ async function connectToWhatsApp(phone: string) {
                 const isAnyCommand = isRvoCommand || isBratVidCommand || isBratCommand || isDownloadCommand || 
                                      isSpotifyCommand || isCurlCommand || isStikCommand || isPhotCommand || 
                                      isLoggerCommand || isUpwinkCommand || isTxtimgCommand || isMenuasCommand || 
-                                     isAiCommand || isJidCommand;
+                                     isAiCommand || isJidCommand || isNoteasCommand;
 
                 const allowedResult = isChatAllowedForAi(senderJid);
                 const isAiAutoReply = allowedResult.allowed && allowedResult.autoReply && !isAnyCommand && !msg.key.fromMe && body.trim() !== "";
@@ -1838,58 +2105,63 @@ async function connectToWhatsApp(phone: string) {
                         const downloadedImages: Buffer[] = [];
                         const downloadedVideos: Buffer[] = [];
 
-                        // Process Images
-                        if (media.images && media.images.length > 0) {
-                            addLog(`Ditemukan ${media.images.length} gambar, mendownload...`);
-                            for (let i = 0; i < media.images.length; i++) {
-                                const imgUrl = media.images[i];
-                                try {
-                                    const imgRes = await fetch(imgUrl, {
-                                        headers: {
-                                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                            "Referer": "https://www.instagram.com/"
-                                        }
-                                    });
-                                    if (imgRes.ok) {
-                                        const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
-                                        const headStr = imgBuffer.subarray(0, 100).toString("utf-8");
-                                        if (headStr.includes("<html") || headStr.includes("<!DOCTYPE")) {
-                                            addLog(`Gagal: File gambar ke-${i+1} terdeteksi sebagai halaman HTML.`);
-                                            continue;
-                                        }
-                                        downloadedImages.push(imgBuffer);
-                                    }
-                                } catch (e) {
-                                    addLog(`Gagal download gambar ke-${i+1}: ${e}`);
-                                }
+                        // We combine both image and video URLs to download and correctly classify them via magic-bytes check!
+                        const allUrlsToDownload = [
+                            ...(media.images || []).map(url => ({ url, defaultType: "image" as const })),
+                            ...(media.videos || []).map(url => ({ url, defaultType: "video" as const }))
+                        ];
+
+                        // Deduplicate URLs
+                        const uniqueUrlsToDownload: { url: string; defaultType: "image" | "video" }[] = [];
+                        const seenUrls = new Set<string>();
+                        for (const item of allUrlsToDownload) {
+                            if (!seenUrls.has(item.url)) {
+                                seenUrls.add(item.url);
+                                uniqueUrlsToDownload.push(item);
                             }
                         }
 
-                        // Process Videos
-                        if (media.videos && media.videos.length > 0) {
-                            addLog(`Ditemukan ${media.videos.length} video, mendownload...`);
-                            for (let i = 0; i < media.videos.length; i++) {
-                                const videoUrl = media.videos[i];
-                                try {
-                                    const videoRes = await fetch(videoUrl, {
-                                        headers: {
-                                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                            "Referer": "https://www.instagram.com/",
-                                            "Accept": "*/*"
-                                        }
-                                    });
-                                    if (videoRes.ok) {
-                                        const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
-                                        const headStr = videoBuffer.subarray(0, 100).toString("utf-8");
-                                        if (headStr.includes("<html") || headStr.includes("<!DOCTYPE") || videoBuffer.length < 5000) {
-                                            addLog(`Gagal: File video ke-${i+1} terdeteksi sebagai halaman HTML/error (ukuran: ${videoBuffer.length} bytes).`);
-                                            continue;
-                                        }
-                                        downloadedVideos.push(videoBuffer);
+                        addLog(`Mulai mendownload ${uniqueUrlsToDownload.length} media...`);
+                        for (let i = 0; i < uniqueUrlsToDownload.length; i++) {
+                            const { url, defaultType } = uniqueUrlsToDownload[i];
+                            try {
+                                addLog(`Mendownload media ke-${i+1}: ${url}`);
+                                const res = await fetch(url, {
+                                    headers: {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                        "Referer": "https://www.instagram.com/",
+                                        "Accept": "*/*"
                                     }
-                                } catch (e) {
-                                    addLog(`Gagal download video ke-${i+1}: ${e}`);
+                                });
+                                if (res.ok) {
+                                    const buffer = Buffer.from(await res.arrayBuffer());
+                                    const headStr = buffer.subarray(0, 100).toString("utf-8");
+                                    if (headStr.includes("<html") || headStr.includes("<!DOCTYPE") || buffer.length < 100) {
+                                        addLog(`Gagal: File ke-${i+1} terdeteksi sebagai halaman HTML atau terlalu kecil.`);
+                                        continue;
+                                    }
+
+                                    // Detect the actual type from buffer
+                                    const detectedType = detectMediaType(buffer);
+                                    addLog(`Media ke-${i+1} terdeteksi type: ${detectedType} (default: ${defaultType})`);
+
+                                    if (detectedType === "image") {
+                                        downloadedImages.push(buffer);
+                                    } else if (detectedType === "video") {
+                                        downloadedVideos.push(buffer);
+                                    } else {
+                                        // Fallback to defaultType if unknown
+                                        if (defaultType === "image") {
+                                            downloadedImages.push(buffer);
+                                        } else {
+                                            downloadedVideos.push(buffer);
+                                        }
+                                    }
+                                } else {
+                                    addLog(`Gagal download media ke-${i+1}: HTTP ${res.status}`);
                                 }
+                            } catch (e) {
+                                addLog(`Gagal download media ke-${i+1}: ${e}`);
                             }
                         }
 
@@ -2957,11 +3229,45 @@ async function connectToWhatsApp(phone: string) {
                         continue;
                     }
 
+                    // Compute isAlya to apply special character rules
+                    const senderStr = (msg.key.participant || msg.key.remoteJid || "").toLowerCase();
+                    const isAlya = senderStr.includes("87742474121438") || 
+                                   senderStr.includes("6289502093559") || 
+                                   senderStr.includes("alya") ||
+                                   remoteJid.toLowerCase().includes("87742474121438") || 
+                                   remoteJid.toLowerCase().includes("6289502093559") ||
+                                   remoteJid.toLowerCase().includes("alya");
+
+                    const isNoteasAllowed = isChatAllowedForNoteas(remoteJid);
+
                     // For AI Auto-Reply, check if we need to send the greeting message first
                     if (isAiAutoReply && !checkResult.welcomeSent) {
                         const cleanPhone = senderJid.split("@")[0];
                         const displayName = msg.pushName || "Alya";
-                        const greeting = `Hai ${displayName} (${cleanPhone}), yahh Ken nya lagi kerja nih, sementara aku dikirim buat nemenin kamu biar nggak bete, nanti aku kasih tahu kalo Ken udah bisa megang hp.`;
+                        let greeting = "";
+                        
+                        if (isNoteasAllowed) {
+                            if (isAlya) {
+                                greeting = `Hai ${displayName} ✨, yahh Ken-nya lagi sibuk kerja nih... Makanya aku (Astro Bot) diutus khusus buat nemenin kamu biar nggak gabut/bete! Nanti kalau Ken udah luang dan megang hp, langsung aku colek dia biar buru-buru balas chat kamu ya! 😉🫶`;
+                            } else {
+                                greeting = `Hai ${displayName} (${cleanPhone}), yahh Ken nya lagi kerja nih, sementara aku dikirim buat nemenin kamu biar nggak bete, nanti aku kasih tahu kalo Ken udah bisa megang hp.`;
+                            }
+
+                            if (noteasText) {
+                                const noteLower = noteasText.toLowerCase();
+                                if (noteLower.startsWith("hai") || noteLower.startsWith("halo") || noteLower.startsWith("helo")) {
+                                    greeting = noteasText;
+                                } else {
+                                    if (isAlya) {
+                                        greeting = `Hai ${displayName} ✨, ${noteasText}`;
+                                    } else {
+                                        greeting = `Hai ${displayName} (${cleanPhone}), ${noteasText}`;
+                                    }
+                                }
+                            }
+                        } else {
+                            greeting = `Hai ${displayName} ✨! Aku Astro Bot, asisten virtual Ken yang pinter dan asyik. Ada yang bisa aku bantu hari ini? 😉`;
+                        }
                         
                         await sock.sendMessage(remoteJid, { text: greeting }, { quoted: msg });
                         markWelcomeSent(senderJid);
@@ -3009,7 +3315,27 @@ async function connectToWhatsApp(phone: string) {
                     let chatHistory = aiMemoryStore.get(remoteJid) || [];
 
                     // Construct system instructions and memory context
-                    const systemPrompt = `Kamu adalah Astro Bot, sebuah bot asisten WhatsApp yang pintar, ramah, dan asyik. Pemilik kamu adalah astrolynx (Ken). Jawab percakapan dengan bahasa Indonesia yang santai, seru, dan penuh kepribadian. Selalu ingat identitas ini dalam setiap jawabanmu!`;
+                    let noteasContext = "";
+                    if (isNoteasAllowed && noteasText) {
+                        noteasContext = `\n\nINFO PENTING SAAT INI TENTANG KEN (PEMILIKMU):\n${noteasText}\n\nGunakan info di atas untuk menjawab jika ditanya tentang keberadaan Ken, apa yang sedang dilakukan Ken, atau mengapa dia belum balas chat.`;
+                    }
+
+                    let personalityPrompt = "";
+                    if (isAlya) {
+                        personalityPrompt = `Kamu adalah Astro Bot, sebuah bot asisten WhatsApp yang lucu, humoris, pinter, ramah, dan asyik. Pemilik kamu adalah astrolynx (Ken).
+Kamu saat ini sedang mengobrol dengan ALYA (sosok perempuan yang sangat spesial/teman dekat Ken).
+ATURAN EMAS UTAMA UNTUK ALYA:
+1. HARAM HUKUMNYA memanggil Alya dengan kata "bro", "bray", "man", "lu", "gua", "ndra", "cuk", "bang", "mas", atau sebutan maskulin/kasar lainnya! Jangan panggil dia "bro"!
+2. Panggil dia dengan nama "Alya", "Al", atau sebutan manis/gemes yang lucu secara interaktif (seperti "Al-sayang" secara bercanda, "Al-gemes", atau sejenisnya).
+3. Karakter kamu kepada Alya harus extra perhatian, kritis tapi lucu, humoris, dan suka ngegodain (gombal-gombal tipis yang bikin senyum/salting, contoh: "Bintang di langit aja minder liat ketikan manis kamu, Al", atau "Denger suara notif dari kamu aslinya bikin Ken salting brutal lho").
+4. Jika dia belum makan, belum mandi, atau begadang, berikan perhatian yang kritis (ngomel-ngomel gemes/lucu, contoh: "Begadang mulu Al, mau jadi batman ya? Awas ya besok ngeluh pusing, aku cubit virtual nih!").
+5. Bicara dengan bahasa Indonesia santai yang tidak kaku, super ekspresif, gaul ala Gen Z (pake slang/kata gaul seperti: "wkwk", "bjir", "ygy", "savage", "capek bgt", "gemes", "plis", "salting", "mengsedih", "gokil"), dan sertakan emoji-emoji lucu yang serasi (✨, 😭, 💀, 🤣, 💅, 🙄, 🥺, 🫶, 💥). Jawab dengan penuh kepribadian!`;
+                    } else {
+                        personalityPrompt = `Kamu adalah Astro Bot, sebuah bot asisten WhatsApp yang pintar, ramah, lucu, humoris, kritis, perhatian, dan asyik. Pemilik kamu adalah astrolynx (Ken).
+Bicaralah dengan bahasa Indonesia santai ala Gen Z yang santai, seru, penuh humor, tidak kaku, gaul (pake kata gaul seperti: "wkwk", "bro", "bray", "lu", "gua", "bjir", "ygy", "savage", "gokil", "plis"), dan sertakan emoji-emoji lucu yang serasi (✨, 😭, 💀, 🤣, 🙄, 🥺, 🫶). Jawab percakapan dengan penuh kepribadian!`;
+                    }
+
+                    const systemPrompt = `${personalityPrompt}${noteasContext}`;
 
                     let contextPrompt = `${systemPrompt}\n\n`;
                     if (chatHistory.length > 0) {
@@ -3025,49 +3351,9 @@ async function connectToWhatsApp(phone: string) {
                     try {
                         let aiResponse = "";
                         let isGeminiUsed = false;
+                        const preferredEngine = aiConfig.engine || "gemini";
 
-                        try {
-                        // Call Azbry GPT-4o API
-                        const apiUrL = `https://api.azbry.com/api/ai/gpt4o?q=${encodeURIComponent(contextPrompt)}`;
-                        addLog(`Memanggil GPT-4o API dengan context memory: ${apiUrL}`);
-
-                        const response = await fetch(apiUrL, {
-                            headers: {
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                            }
-                        });
-
-                        if (!response.ok) {
-                            throw new Error(`Server returned status code ${response.status}`);
-                        }
-
-                        const textResult = await response.text();
-                        
-                        // Let's check if it returned error/502
-                        if (textResult.includes("error code: 502") || textResult.includes("Bad Gateway") || !textResult.trim()) {
-                            throw new Error("API Azbry GPT-4o saat ini sedang 502 Bad Gateway / offline.");
-                        }
-
-                        // Try parsing if it's JSON with result, otherwise use plain text
-                        aiResponse = textResult;
-                        try {
-                            const parsed = JSON.parse(textResult);
-                            if (parsed && typeof parsed === "object") {
-                                if (parsed.result && typeof parsed.result === "object" && parsed.result.answer) {
-                                    aiResponse = parsed.result.answer;
-                                } else {
-                                    aiResponse = parsed.result || parsed.response || parsed.text || parsed.data || JSON.stringify(parsed);
-                                }
-                            }
-                        } catch (jsonErr) {
-                            // Keep as plain text
-                        }
-                    } catch (err: any) {
-                        console.warn("Azbry API Gagal, mencoba fallback ke Gemini API:", err);
-                        addLog("Azbry API Gagal, mencoba fallback ke Gemini API: " + (err.message || err));
-                        
-                        try {
-                            // Initialize GoogleGenAI with Gemini API key
+                        const callGemini = async () => {
                             const geminiKey = process.env.GEMINI_API_KEY;
                             const ai = new GoogleGenAI({
                                 apiKey: geminiKey,
@@ -3078,7 +3364,6 @@ async function connectToWhatsApp(phone: string) {
                                 }
                             });
 
-                            // Reconstruct contents format for Gemini
                             const contents: any[] = [];
                             for (const h of chatHistory) {
                                 contents.push({
@@ -3101,38 +3386,221 @@ async function connectToWhatsApp(phone: string) {
                             });
 
                             if (geminiResponse && geminiResponse.text) {
-                                aiResponse = geminiResponse.text;
-                                isGeminiUsed = true;
-                                addLog("Berhasil mendapatkan respon dari Gemini API (Fallback)");
+                                return geminiResponse.text;
                             } else {
                                 throw new Error("Gemini API tidak mengembalikan teks.");
                             }
-                        } catch (geminiErr: any) {
-                            console.error("Gemini Fallback Error:", geminiErr);
-                            addLog("Gemini Fallback Error: " + (geminiErr.message || geminiErr));
-                            throw new Error(`API Utama (GPT-4o) dan API Cadangan (Gemini) keduanya gagal.\n\n• GPT-4o: ${err.message || err}\n• Gemini: ${geminiErr.message || geminiErr}`);
+                        };
+
+                        const callQwen = async () => {
+                            const apiUrL = `https://api.azbry.com/api/ai/qwen?q=${encodeURIComponent(contextPrompt)}`;
+                            addLog(`Memanggil Qwen API: ${apiUrL}`);
+
+                            const response = await fetch(apiUrL, {
+                                headers: {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                                }
+                            });
+
+                            if (!response.ok) {
+                                throw new Error(`Qwen API returned status code ${response.status}`);
+                            }
+
+                            const textResult = await response.text();
+                            if (textResult.includes("error code: 502") || textResult.includes("Bad Gateway") || !textResult.trim()) {
+                                throw new Error("API Qwen saat ini sedang 502 Bad Gateway / offline.");
+                            }
+
+                            let parsedResult = textResult;
+                            try {
+                                const parsed = JSON.parse(textResult);
+                                if (parsed && typeof parsed === "object") {
+                                    if (parsed.result !== undefined) {
+                                        if (parsed.result && typeof parsed.result === "object") {
+                                            parsedResult = parsed.result.response || parsed.result.answer || parsed.result.result || JSON.stringify(parsed.result);
+                                        } else {
+                                            parsedResult = String(parsed.result);
+                                        }
+                                    } else if (parsed.response !== undefined) {
+                                        parsedResult = String(parsed.response);
+                                    } else {
+                                        parsedResult = parsed.text || parsed.data || JSON.stringify(parsed);
+                                    }
+                                }
+                            } catch (jsonErr) {
+                                // Keep as plain text
+                            }
+                            return parsedResult;
+                        };
+
+                        const callClaude = async () => {
+                            const apiUrL = `https://api.azbry.com/api/ai/claude?q=${encodeURIComponent(contextPrompt)}`;
+                            addLog(`Memanggil Claude API: ${apiUrL}`);
+
+                            const response = await fetch(apiUrL, {
+                                headers: {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                                }
+                            });
+
+                            if (!response.ok) {
+                                throw new Error(`Claude API returned status code ${response.status}`);
+                            }
+
+                            const textResult = await response.text();
+                            if (textResult.includes("error code: 502") || textResult.includes("Bad Gateway") || !textResult.trim()) {
+                                throw new Error("API Claude saat ini sedang 502 Bad Gateway / offline.");
+                            }
+
+                            let parsedResult = textResult;
+                            try {
+                                const parsed = JSON.parse(textResult);
+                                if (parsed && typeof parsed === "object") {
+                                    if (parsed.result !== undefined) {
+                                        if (parsed.result && typeof parsed.result === "object") {
+                                            parsedResult = parsed.result.response || parsed.result.answer || parsed.result.result || JSON.stringify(parsed.result);
+                                        } else {
+                                            parsedResult = String(parsed.result);
+                                        }
+                                    } else if (parsed.response !== undefined) {
+                                        parsedResult = String(parsed.response);
+                                    } else {
+                                        parsedResult = parsed.text || parsed.data || JSON.stringify(parsed);
+                                    }
+                                }
+                            } catch (jsonErr) {
+                                // Keep as plain text
+                            }
+                            return parsedResult;
+                        };
+
+                        const callGpt4o = async () => {
+                            const apiUrL = `https://api.azbry.com/api/ai/gpt4o?q=${encodeURIComponent(contextPrompt)}`;
+                            addLog(`Memanggil GPT-4o API: ${apiUrL}`);
+
+                            const response = await fetch(apiUrL, {
+                                headers: {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                                }
+                            });
+
+                            if (!response.ok) {
+                                throw new Error(`Server returned status code ${response.status}`);
+                            }
+
+                            const textResult = await response.text();
+                            
+                            if (textResult.includes("error code: 502") || textResult.includes("Bad Gateway") || !textResult.trim()) {
+                                throw new Error("API Azbry GPT-4o saat ini sedang 502 Bad Gateway / offline.");
+                            }
+
+                            let parsedResult = textResult;
+                            try {
+                                const parsed = JSON.parse(textResult);
+                                if (parsed && typeof parsed === "object") {
+                                    if (parsed.result && typeof parsed.result === "object" && parsed.result.answer) {
+                                        parsedResult = parsed.result.answer;
+                                    } else {
+                                        parsedResult = parsed.result || parsed.response || parsed.text || parsed.data || JSON.stringify(parsed);
+                                    }
+                                }
+                            } catch (jsonErr) {
+                                // Keep as plain text
+                            }
+                            return parsedResult;
+                        };
+
+                        const callRestApi = async () => {
+                            try {
+                                addLog("Mencoba RestAPI -> Qwen...");
+                                return await callQwen();
+                            } catch (qwenErr: any) {
+                                console.warn("Qwen API gagal, mencoba Claude...", qwenErr);
+                                addLog(`Qwen API gagal, mencoba Claude: ${qwenErr.message || qwenErr}`);
+                                try {
+                                    return await callClaude();
+                                } catch (claudeErr: any) {
+                                    console.warn("Claude API gagal, mencoba GPT-4o...", claudeErr);
+                                    addLog(`Claude API gagal, mencoba GPT-4o: ${claudeErr.message || claudeErr}`);
+                                    return await callGpt4o();
+                                }
+                            }
+                        };
+
+                        if (preferredEngine === "gemini") {
+                            try {
+                                addLog("Memanggil Gemini API (Primary Engine)...");
+                                aiResponse = await callGemini();
+                                isGeminiUsed = true;
+                                addLog("Berhasil mendapatkan respon dari Gemini API (Primary)");
+                            } catch (geminiErr: any) {
+                                console.warn("Gemini API Gagal, mencoba fallback ke RestAPI (Qwen/Claude/GPT-4o):", geminiErr);
+                                addLog(`Gemini API Gagal, mencoba fallback ke RestAPI: ${geminiErr.message || geminiErr}`);
+                                try {
+                                    aiResponse = await callRestApi();
+                                    isGeminiUsed = false;
+                                    addLog("Berhasil mendapatkan respon dari RestAPI (Fallback)");
+                                } catch (restErr: any) {
+                                    console.error("RestAPI Fallback Error:", restErr);
+                                    addLog(`RestAPI Fallback Error: ${restErr.message || restErr}`);
+                                    throw new Error(`API Utama (Gemini) dan API Cadangan (RestAPI) keduanya gagal.\n\n• Gemini: ${geminiErr.message || geminiErr}\n• RestAPI: ${restErr.message || restErr}`);
+                                }
+                            }
+                        } else {
+                            try {
+                                addLog("Memanggil RestAPI (Primary Engine)...");
+                                aiResponse = await callRestApi();
+                                isGeminiUsed = false;
+                                addLog("Berhasil mendapatkan respon dari RestAPI (Primary)");
+                            } catch (restErr: any) {
+                                console.warn("RestAPI Gagal, mencoba fallback ke Gemini API:", restErr);
+                                addLog(`RestAPI Gagal, mencoba fallback ke Gemini API: ${restErr.message || restErr}`);
+                                try {
+                                    aiResponse = await callGemini();
+                                    isGeminiUsed = true;
+                                    addLog("Berhasil mendapatkan respon dari Gemini API (Fallback)");
+                                } catch (geminiErr: any) {
+                                    console.error("Gemini Fallback Error:", geminiErr);
+                                    addLog(`Gemini Fallback Error: ${geminiErr.message || geminiErr}`);
+                                    throw new Error(`API Utama (RestAPI) dan API Cadangan (Gemini) keduanya gagal.\n\n• RestAPI: ${restErr.message || restErr}\n• Gemini: ${geminiErr.message || geminiErr}`);
+                                }
+                            }
                         }
-                    }
 
-                    const badge = isGeminiUsed ? "🤖 *Astro Bot* 🤖" : "🤖 *GPT-4o AI ANSWER* 🤖";
-                    await sock.sendMessage(remoteJid, {
-                        text: `${badge}\n\n${aiResponse.trim()}`
-                    }, { quoted: msg });
+                        // Send response
+                        const badge = isGeminiUsed ? "🤖 *Astro Bot (Gemini)* 🤖" : "🤖 *Astro AI (RestAPI)* 🤖";
+                        await sock.sendMessage(remoteJid, {
+                            text: `${badge}\n\n${aiResponse.trim()}`
+                        }, { quoted: msg });
 
-                    // Save to history on successful response
-                    chatHistory.push({ role: "user", content: prompt });
-                    chatHistory.push({ role: "assistant", content: aiResponse });
-                    if (chatHistory.length > MAX_MEMORY_LENGTH) {
-                        chatHistory = chatHistory.slice(-MAX_MEMORY_LENGTH);
-                    }
-                    aiMemoryStore.set(remoteJid, chatHistory);
+                        // Save to history on successful response
+                        chatHistory.push({ role: "user", content: prompt });
+                        chatHistory.push({ role: "assistant", content: aiResponse });
+                        if (chatHistory.length > MAX_MEMORY_LENGTH) {
+                            chatHistory = chatHistory.slice(-MAX_MEMORY_LENGTH);
+                        }
+                        aiMemoryStore.set(remoteJid, chatHistory);
 
                     } catch (err: any) {
                         console.error("AI Command Error:", err);
                         addLog("AI Command Error: " + (err.message || err));
-                        await sock.sendMessage(remoteJid, {
-                            text: `❌ *Gagal Mendapatkan Jawaban AI*\n\nMaaf bos, terjadi kesalahan atau API sedang down.\n\n*Error:* ${err.message || err}`
-                        }, { quoted: msg });
+                        
+                        // Check if sender or chat JID is Alya to suppress error messages
+                        const senderStr = (msg.key.participant || msg.key.remoteJid || "").toLowerCase();
+                        const isAlya = senderStr.includes("87742474121438") || 
+                                       senderStr.includes("6289502093559") || 
+                                       senderStr.includes("alya") ||
+                                       remoteJid.toLowerCase().includes("87742474121438") || 
+                                       remoteJid.toLowerCase().includes("6289502093559") ||
+                                       remoteJid.toLowerCase().includes("alya");
+
+                        if (!isAlya) {
+                            await sock.sendMessage(remoteJid, {
+                                text: `❌ *Gagal Mendapatkan Jawaban AI*\n\nMaaf bos, terjadi kesalahan atau API sedang down.\n\n*Error:* ${err.message || err}`
+                            }, { quoted: msg });
+                        } else {
+                            addLog(`[Alya Suppress] Pesan error AI tidak dikirim ke Alya untuk kenyamanan.`);
+                        }
                     }
                     continue;
                 }
@@ -3165,6 +3633,60 @@ async function connectToWhatsApp(phone: string) {
                                     `💡 _JID ini bisa Anda gunakan untuk membatasi fitur AI di Dashboard!_`;
 
                     await sock.sendMessage(remoteJid, { text: message }, { quoted: msg });
+                    continue;
+                }
+
+                if (isNoteasCommand) {
+                    const remoteJid = msg.key.remoteJid;
+                    if (!isFeatureEnabled("noteas")) {
+                        await sock.sendMessage(remoteJid, {
+                            text: "⚠️ *Fitur Dinonaktifkan*\n\nMaaf bos, fitur *Noteas Status AI* saat ini sedang dinonaktifkan oleh Admin melalui Dashboard."
+                        }, { quoted: msg });
+                        continue;
+                    }
+                    if (!msg.key.fromMe) {
+                        await sock.sendMessage(remoteJid, {
+                            text: "🔒 *Akses Terbatas*\n\nMaaf bos, perintah ini hanya bisa dijalankan oleh Pemilik Bot dari HP Sendiri."
+                        }, { quoted: msg });
+                        continue;
+                    }
+
+                    addLog(`Perintah Noteas dideteksi dari ${remoteJid}`);
+
+                    try {
+                        await sock.sendMessage(remoteJid, {
+                            react: {
+                                text: "📝",
+                                key: msg.key
+                            }
+                        });
+                    } catch (reactErr) {}
+
+                    const noteText = body.substring(body.toLowerCase().indexOf("noteas") + 6).trim();
+                    if (!noteText) {
+                        const message = `📝 *Noteas Status* 📝\n\n` +
+                                        `*Status Saat Ini:*\n"${noteasText || 'Belum ada status'}"\n\n` +
+                                        `*Cara Mengubah:*\n\`.noteas <status baru>\`\n` +
+                                        `_Contoh:_\n\`.noteas info sekarang saya lagi makan siang, klo alya chat bilang lagi makan dulu tolong kamu temenin\`\n\n` +
+                                        `*Cara Menghapus:*\n\`.noteas clear\` atau \`.noteas reset\``;
+                        await sock.sendMessage(remoteJid, { text: message }, { quoted: msg });
+                        continue;
+                    }
+
+                    if (noteText.toLowerCase() === "clear" || noteText.toLowerCase() === "reset") {
+                        noteasText = "";
+                        saveNoteas();
+                        await sock.sendMessage(remoteJid, {
+                            text: "🧹 *Status Noteas Berhasil Dihapus!*\n\nSekarang bot akan kembali ke status default (Lagi kerja)."
+                        }, { quoted: msg });
+                        continue;
+                    }
+
+                    noteasText = noteText;
+                    saveNoteas();
+                    await sock.sendMessage(remoteJid, {
+                        text: `📝 *Status Noteas Berhasil Disimpan!*\n\n*Status Sekarang:*\n"${noteasText}"\n\nBot akan otomatis menyesuaikan info ini saat menjawab chat!`
+                    }, { quoted: msg });
                     continue;
                 }
             }
@@ -3246,7 +3768,7 @@ app.get("/api/ai/config", (req, res) => {
 });
 
 app.post("/api/ai/config", (req, res) => {
-    const { allowedChats } = req.body;
+    const { allowedChats, engine } = req.body;
     if (!Array.isArray(allowedChats)) {
         return res.status(400).json({ error: "Format daftar nomor/grup tidak valid! Harus berupa array." });
     }
@@ -3275,10 +3797,48 @@ app.post("/api/ai/config", (req, res) => {
         };
     }).filter(item => item.jid);
     
+    if (engine === "gemini" || engine === "gpt4o" || engine === "restapi") {
+        aiConfig.engine = engine;
+    }
+    
     saveAiConfig();
     const listJids = aiConfig.allowedChats.map(item => `${item.jid} (AutoReply: ${item.autoReply})`).join(", ");
-    addGlobalLog(`Daftar izin fitur AI diperbarui: [${listJids}]`);
+    addGlobalLog(`Daftar izin fitur AI diperbarui: [${listJids}], Engine: ${aiConfig.engine}`);
     return res.json({ success: true, config: aiConfig });
+});
+
+app.get("/api/noteas/config", (req, res) => {
+    return res.json({
+        allowedChats: noteasConfig.allowedChats,
+        text: noteasText
+    });
+});
+
+app.post("/api/noteas/config", (req, res) => {
+    const { allowedChats, text } = req.body;
+    if (allowedChats !== undefined) {
+        if (!Array.isArray(allowedChats)) {
+            return res.status(400).json({ error: "Format daftar nomor/grup tidak valid! Harus berupa array." });
+        }
+        noteasConfig.allowedChats = allowedChats.map((item: any) => {
+            const cleanJid = String(typeof item === "string" ? item : (item.jid || "")).trim();
+            return { jid: cleanJid };
+        }).filter(item => item.jid);
+        saveNoteasConfig();
+    }
+    if (text !== undefined) {
+        noteasText = String(text).trim();
+        saveNoteas();
+    }
+    const listJids = noteasConfig.allowedChats.map(item => item.jid).join(", ");
+    addGlobalLog(`Daftar izin fitur Noteas diperbarui: [${listJids}], Status saat ini: "${noteasText}"`);
+    return res.json({
+        success: true,
+        config: {
+            allowedChats: noteasConfig.allowedChats,
+            text: noteasText
+        }
+    });
 });
 
 app.get("/api/features", (req, res) => {

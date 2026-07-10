@@ -96,8 +96,13 @@ export default function App() {
   const [features, setFeatures] = useState<Feature[]>([]);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [featureStats, setFeatureStats] = useState<Record<string, number>>({});
-  const [aiConfig, setAiConfig] = useState<{ allowedChats: { jid: string; autoReply: boolean; welcomeSent?: boolean }[] }>({ allowedChats: [] });
+  const [aiConfig, setAiConfig] = useState<{ allowedChats: { jid: string; autoReply: boolean; welcomeSent?: boolean }[], engine?: "gemini" | "gpt4o" | "restapi" }>({ allowedChats: [], engine: "gemini" });
   const [aiConfigSaving, setAiConfigSaving] = useState(false);
+
+  const [noteasConfig, setNoteasConfig] = useState<{ allowedChats: { jid: string }[] }>({ allowedChats: [] });
+  const [noteasText, setNoteasText] = useState<string>("");
+  const [newNoteasChat, setNewNoteasChat] = useState("");
+  const [noteasSaving, setNoteasSaving] = useState(false);
 
   // Active navigation tab
   const [activeTab, setActiveTab] = useState<"whatsapp" | "ssh">("whatsapp");
@@ -312,17 +317,21 @@ export default function App() {
     }
   };
 
-  const handleUpdateAiConfig = async (allowedChats: { jid: string; autoReply: boolean; welcomeSent?: boolean }[]) => {
+  const handleUpdateAiConfig = async (
+    allowedChats: { jid: string; autoReply: boolean; welcomeSent?: boolean }[],
+    engine?: "gemini" | "gpt4o" | "restapi"
+  ) => {
     setAiConfigSaving(true);
     try {
+      const activeEngine = engine !== undefined ? engine : (aiConfig.engine || "gemini");
       const res = await fetch("/api/ai/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ allowedChats })
+        body: JSON.stringify({ allowedChats, engine: activeEngine })
       });
       if (res.ok) {
         const data = await res.json();
-        setAiConfig(data.config || { allowedChats });
+        setAiConfig(data.config || { allowedChats, engine: activeEngine });
       } else {
         const errData = await res.json();
         alert(errData.error || "Gagal menyimpan konfigurasi AI.");
@@ -358,6 +367,63 @@ export default function App() {
       c.jid === jid ? { ...c, autoReply: !currentAutoReply } : c
     );
     handleUpdateAiConfig(updated);
+  };
+
+  const fetchNoteasConfig = async () => {
+    try {
+      const res = await fetch("/api/noteas/config");
+      if (res.ok) {
+        const data = await res.json();
+        setNoteasConfig({ allowedChats: data.allowedChats || [] });
+        setNoteasText(data.text || "");
+      }
+    } catch (e) {
+      console.warn("Gagal mengambil konfigurasi Noteas", e);
+    }
+  };
+
+  const handleUpdateNoteasConfig = async (
+    allowedChats: { jid: string }[],
+    text?: string
+  ) => {
+    setNoteasSaving(true);
+    try {
+      const activeText = text !== undefined ? text : noteasText;
+      const res = await fetch("/api/noteas/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allowedChats, text: activeText })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setNoteasConfig({ allowedChats: data.config.allowedChats || [] });
+        setNoteasText(data.config.text || "");
+      } else {
+        const errData = await res.json();
+        alert(errData.error || "Gagal menyimpan konfigurasi Noteas.");
+      }
+    } catch (e) {
+      console.warn("Gagal menyimpan konfigurasi Noteas", e);
+    } finally {
+      setNoteasSaving(false);
+    }
+  };
+
+  const handleAddNoteasChat = () => {
+    const val = newNoteasChat.trim();
+    if (!val) return;
+    if (noteasConfig.allowedChats.some(c => c.jid.toLowerCase() === val.toLowerCase())) {
+      setNewNoteasChat("");
+      return;
+    }
+    const updated = [...noteasConfig.allowedChats, { jid: val }];
+    handleUpdateNoteasConfig(updated);
+    setNewNoteasChat("");
+  };
+
+  const handleRemoveNoteasChat = (chatToRemove: string) => {
+    const updated = noteasConfig.allowedChats.filter(c => c.jid !== chatToRemove);
+    handleUpdateNoteasConfig(updated);
   };
 
   const handleToggleFeature = async (id: string, currentStatus: boolean) => {
@@ -444,6 +510,7 @@ export default function App() {
     if (!isAuthenticated) return;
     fetchFeatures();
     fetchAiConfig();
+    fetchNoteasConfig();
     fetchSshConfig();
   }, [isAuthenticated]);
 
@@ -1113,7 +1180,41 @@ export default function App() {
 
                     {feat.id === "ai" && (
                       <div className="mt-3 border-t border-white/5 pt-3 space-y-2.5">
-                        <label className="text-[10px] font-bold text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
+                        {/* Preferred AI Engine Selector */}
+                        <div className="bg-black/25 border border-white/5 rounded-xl p-2.5 space-y-1.5">
+                          <label className="text-[10px] font-bold text-gray-300 uppercase tracking-wider flex items-center justify-between">
+                            <span>Preferred AI Engine</span>
+                            <span className="text-[9px] text-gray-500 font-normal uppercase font-mono">Active: {aiConfig.engine || "gemini"}</span>
+                          </label>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              onClick={() => handleUpdateAiConfig(aiConfig.allowedChats, "gemini")}
+                              disabled={aiConfigSaving}
+                              className={`px-3 py-1.5 rounded-lg text-[10px] font-medium border transition-all flex items-center justify-center gap-1.5 ${
+                                (aiConfig.engine || "gemini") === "gemini"
+                                  ? "bg-indigo-600/25 border-indigo-500/50 text-indigo-300 shadow-md"
+                                  : "bg-black/30 border-white/5 text-gray-400 hover:border-white/10 hover:text-white"
+                              }`}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                              Gemini (Primary/Stable)
+                            </button>
+                            <button
+                              onClick={() => handleUpdateAiConfig(aiConfig.allowedChats, "restapi")}
+                              disabled={aiConfigSaving}
+                              className={`px-3 py-1.5 rounded-lg text-[10px] font-medium border transition-all flex items-center justify-center gap-1.5 ${
+                                aiConfig.engine === "restapi" || aiConfig.engine === "gpt4o"
+                                  ? "bg-indigo-600/25 border-indigo-500/50 text-indigo-300 shadow-md"
+                                  : "bg-black/30 border-white/5 text-gray-400 hover:border-white/10 hover:text-white"
+                              }`}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                              RestAPI (Qwen & GPT-4o)
+                            </button>
+                          </div>
+                        </div>
+
+                        <label className="text-[10px] font-bold text-gray-300 uppercase tracking-wider flex items-center gap-1.5 pt-1">
                           <LockOpen className="w-3.5 h-3.5 text-indigo-400" />
                           Daftar Izin Chat (Nomor / Grup)
                         </label>
@@ -1188,6 +1289,90 @@ export default function App() {
                         ) : (
                           <p className="text-[9px] text-amber-500/85 italic bg-amber-500/5 border border-amber-500/10 rounded-xl p-2.5 leading-normal">
                             ⚠️ Fitur AI hanya aktif untuk JID/nomor yang didaftarkan di atas. Jika kosong, AI tidak akan merespon siapapun demi keamanan!
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {feat.id === "noteas" && (
+                      <div className="mt-3 border-t border-white/5 pt-3 space-y-3">
+                        {/* Noteas Current Text Input */}
+                        <div className="bg-black/25 border border-white/5 rounded-xl p-3 space-y-2">
+                          <label className="text-[10px] font-bold text-gray-300 uppercase tracking-wider flex items-center justify-between">
+                            <span>Status Noteas Saat Ini</span>
+                            <span className="text-[9px] text-emerald-400 font-mono font-bold uppercase">LIVE</span>
+                          </label>
+                          <textarea
+                            rows={3}
+                            placeholder="Contoh: lagi sibuk kerja, klo alya chat tolong bilang nanti malem aku kabarin"
+                            className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-emerald-500 resize-none leading-relaxed"
+                            value={noteasText}
+                            onChange={(e) => setNoteasText(e.target.value)}
+                          />
+                          <div className="flex justify-end">
+                            <button
+                              onClick={() => handleUpdateNoteasConfig(noteasConfig.allowedChats, noteasText)}
+                              disabled={noteasSaving}
+                              className="bg-emerald-500 hover:bg-emerald-600 active:bg-emerald-700 text-white font-bold text-[10px] px-4 py-1.5 rounded-xl transition-all uppercase tracking-wider cursor-pointer"
+                            >
+                              {noteasSaving ? "Menyimpan..." : "Simpan Status"}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Allowed JIDs for Noteas */}
+                        <label className="text-[10px] font-bold text-gray-300 uppercase tracking-wider flex items-center gap-1.5 pt-1">
+                          <LockOpen className="w-3.5 h-3.5 text-emerald-400" />
+                          Daftar Izin Chat Noteas (Nomor / Grup)
+                        </label>
+                        <p className="text-[9px] text-gray-500 leading-normal">
+                          Harus diisi agar Noteas Status AI bisa digunakan untuk JID/nomor chat tertentu (misal masukkan nomor HP <code className="bg-white/5 px-1 py-0.5 rounded text-emerald-400">628xxx</code> atau ID grup <code className="bg-white/5 px-1 py-0.5 rounded text-emerald-400">xxxx@g.us</code>). Sama seperti .ai, jika kosong maka fitur tidak akan aktif untuk siapapun.
+                        </p>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            placeholder="Contoh: 628123456789 atau 120363@g.us"
+                            className="bg-black/40 border border-white/10 rounded-xl px-3 py-1.5 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-emerald-500 flex-1"
+                            value={newNoteasChat}
+                            onChange={(e) => setNewNoteasChat(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  handleAddNoteasChat();
+                              }
+                            }}
+                          />
+                          <button
+                            onClick={handleAddNoteasChat}
+                            disabled={noteasSaving}
+                            className="bg-emerald-500 hover:bg-emerald-600 active:bg-emerald-700 text-white font-bold text-[10px] px-3.5 py-1.5 rounded-xl transition-all uppercase tracking-wider shrink-0 disabled:opacity-50 cursor-pointer"
+                          >
+                            {noteasSaving ? "Simpan..." : "Tambah"}
+                          </button>
+                        </div>
+
+                        {noteasConfig.allowedChats && noteasConfig.allowedChats.length > 0 ? (
+                          <div className="space-y-1.5 pt-1 max-h-48 overflow-y-auto pr-1">
+                            {noteasConfig.allowedChats.map((chat) => (
+                              <div
+                                key={chat.jid}
+                                className="bg-black/35 border border-white/5 hover:border-white/10 rounded-xl px-3 py-2 flex items-center justify-between gap-3 transition-all"
+                              >
+                                <span className="text-[10px] font-mono text-emerald-300 font-medium truncate" title={chat.jid}>{chat.jid}</span>
+                                <button
+                                  onClick={() => handleRemoveNoteasChat(chat.jid)}
+                                  disabled={noteasSaving}
+                                  className="text-gray-500 hover:text-rose-400 transition-colors disabled:opacity-50 text-[10px] px-1.5 py-0.5 hover:bg-white/5 rounded shrink-0 cursor-pointer"
+                                  title="Hapus"
+                                >
+                                  Hapus
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-[9px] text-amber-500/85 italic bg-amber-500/5 border border-amber-500/10 rounded-xl p-2.5 leading-normal">
+                            ⚠️ Fitur Noteas hanya aktif untuk JID/nomor yang didaftarkan di atas. Jika kosong, status Noteas tidak akan aktif untuk siapa pun!
                           </p>
                         )}
                       </div>
