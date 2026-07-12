@@ -2248,7 +2248,9 @@ async function connectToWhatsApp(phone: string) {
                         }
 
                         let carouselSent = false;
-                        if (cardsArray.length > 0) {
+                        // Disable carousel because interactive/carousel messages fail to render on many standard/modded WhatsApp clients,
+                        // causing users to only receive the audio and miss the downloaded videos/photos.
+                        if (false && cardsArray.length > 0) {
                             try {
                                 addLog(`Mengirim ${cardsArray.length} card sebagai carouselMessage...`);
                                 const msgContent = {
